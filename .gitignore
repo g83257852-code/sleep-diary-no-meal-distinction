@@ -1,0 +1,12 @@
+# Node / Next.js
+node_modules
+.next
+.vercel
+out
+dist
+
+# Logs / OS
+npm-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
