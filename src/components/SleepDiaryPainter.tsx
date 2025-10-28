@@ -19,6 +19,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  * 追加：
  * - PDF出力（window.print）＋印刷用CSS（A4横 / UI非表示 / 行の分割防止 / 背景色）
  * - 画面では入力UIのみ、印刷時は値テキストのみ（.no-print / .print-only）
+ * - CSVインポート（エクスポートしたCSVを読み込み、画面に復元して続きから記入可能）
  */
 
 const MIN_PER_CELL = 15;
@@ -150,6 +151,72 @@ const estimateSleepForWakeDay = (
   const midHour = (((midIdx % CELLS_PER_DAY) + CELLS_PER_DAY) % CELLS_PER_DAY) * (MIN_PER_CELL / 60);
   return { startIdx: best.s, endIdx: best.e, durHours, midHour };
 };
+
+// ==== CSV インポート用ユーティリティ ====
+const TIME_HEADERS = Array.from({ length: CELLS_PER_DAY }, (_, i) => {
+  const h = Math.floor(i / 4);
+  const m = (i % 4) * 15;
+  return `${pad2(h)}:${pad2(m)}`;
+});
+
+function parseCsv(text: string) {
+  const lines = text.replace(/\uFEFF/g, "").split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length < 2) throw new Error("CSVにデータ行がありません。");
+  const header = lines[0].split(",");
+
+  const colIndex = (name: string) => header.findIndex((h) => h.trim() === name);
+  const dateIdx = colIndex("date");
+  if (dateIdx < 0) throw new Error("ヘッダーに 'date' 列がありません。");
+
+  const idxHoliday = colIndex("holiday");
+  const idxAlarm = colIndex("alarm");
+  const idxBreakfast = colIndex("breakfast");
+  const idxLunch = colIndex("lunch");
+  const idxDinner = colIndex("dinner");
+  const idxSnacks = colIndex("snacks");
+
+  const timeIdxMap: number[] = TIME_HEADERS.map((lab) => header.findIndex((h) => h.trim() === lab));
+  const hasAllTimeCols = timeIdxMap.every((i) => i >= 0);
+  if (!hasAllTimeCols) throw new Error("00:00〜23:45 の時刻列が見つかりません（エクスポート形式のみ対応）。");
+
+  const store: Record<string, number[]> = {};
+  const meta: Record<string, Meta> = {};
+  let minDate: string | null = null;
+  let maxDate: string | null = null;
+
+  for (let li = 1; li < lines.length; li++) {
+    const row = lines[li].split(",");
+    if (row.length < header.length) continue; // 空行など
+    const key = row[dateIdx]?.trim();
+    if (!key || !/\d{4}-\d{2}-\d{2}/.test(key)) continue;
+
+    const arr = new Array(CELLS_PER_DAY).fill(0).map((_, i) => {
+      const idx = timeIdxMap[i];
+      const v = idx >= 0 ? Number(row[idx]) : 0;
+      return v === 1 ? 1 : 0;
+    });
+
+    store[key] = arr;
+
+    const snacksRaw = idxSnacks >= 0 ? (row[idxSnacks] || "").trim() : "";
+    const snacks = snacksRaw ? snacksRaw.split(";").map((s) => s.trim()).filter(Boolean) : [];
+
+    meta[key] = {
+      holiday: idxHoliday >= 0 ? row[idxHoliday] === "1" : false,
+      alarm: idxAlarm >= 0 ? row[idxAlarm] === "1" : false,
+      breakfast: idxBreakfast >= 0 ? (row[idxBreakfast] || null) : null,
+      lunch: idxLunch >= 0 ? (row[idxLunch] || null) : null,
+      dinner: idxDinner >= 0 ? (row[idxDinner] || null) : null,
+      snacks,
+    };
+
+    if (!minDate || key < minDate) minDate = key;
+    if (!maxDate || key > maxDate) maxDate = key;
+  }
+
+  if (!minDate) throw new Error("有効な日付行が読み込めませんでした。");
+  return { store, meta, minDate, maxDate };
+}
 
 export default function SleepDiaryPainter() {
   // ===== Hydration-safe =====
@@ -368,7 +435,7 @@ export default function SleepDiaryPainter() {
     setSjl(r);
   };
 
-  // CSV
+  // CSV エクスポート
   const exportCsv30 = () => {
     if (!rangeStart) return;
     const header = [
@@ -445,11 +512,37 @@ export default function SleepDiaryPainter() {
     download(`sleep_diary_${pid || "anon"}_${rangeStart}.csv`, csv);
   };
 
+  // CSV インポート
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const handleImportCsvClick = () => fileInputRef.current?.click();
+
+  const handleImportCsvFile = async (file: File) => {
+    try {
+      const text = await file.text();
+      const { store: s, meta: m, minDate } = parseCsv(text);
+      const id = pid || "anon";
+
+      // 状態更新 & 永続化
+      setStore(s);
+      saveAll(s, id);
+      setMeta(m);
+      try { localStorage.setItem(metaKey(id), JSON.stringify(m)); } catch {}
+
+      // 表示開始日をインポートの最小日に
+      if (minDate) setRangeStart(minDate);
+
+      alert("CSVを読み込みました。画面に反映しています。");
+    } catch (err: any) {
+      console.error(err);
+      alert(`CSV読み込みに失敗しました: ${err?.message || err}`);
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = ""; // 同じファイル再読込可
+    }
+  };
+
   // PDF（印刷）
   const handlePrintPDF = () => {
     if (typeof window === "undefined") return;
-    // 印刷前に自動計算したい場合は以下を有効化
-    // handleComputeSRI(); handleComputeSJL();
     window.print();
   };
 
@@ -502,7 +595,10 @@ export default function SleepDiaryPainter() {
           <li>各行左の☑で <strong>休日（休日なら✓）</strong>／<strong>目覚まし（目覚まし使用なら✓）</strong> を記録。</li>
           <li>食事はその日の時刻を入力（間食は複数可）。</li>
           <li>「CSV出力」では、日付、起床時刻、就寝時刻、睡眠時間、食事時刻、睡眠日誌の15分ごとのバイナリデータが出力されます。</li>
+          <li>「CSV読み込み」で過去のCSVを復元し、続きから記入できます（同形式のみ対応）。</li>
           <li>「PDF出力」では、睡眠日誌がそのまま出力されます。</li>
+          <li>同じ端末・同じブラウザでアクセスすると続きから記入できます（シークレットモード、履歴やキャッシュの削除には対応していません）</li>
+          <li>スマートフォンで記入する場合は、画面の設定をライトモードにして、横画面にすると記入しやすいです。</li>
         </ul>
 
         <div className="flex flex-wrap items-center gap-3 mt-2 text-sm">
@@ -581,6 +677,21 @@ export default function SleepDiaryPainter() {
           </button>
           <button onClick={handlePrintPDF} className="px-3 py-2 rounded-lg border bg-neutral-50">
             PDF出力
+          </button>
+
+          {/* CSV インポート */}
+          <input
+            type="file"
+            ref={fileInputRef}
+            accept=".csv,text/csv"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) handleImportCsvFile(f);
+            }}
+          />
+          <button onClick={handleImportCsvClick} className="px-3 py-2 rounded-lg border">
+            CSV読み込み
           </button>
         </div>
       </div>
