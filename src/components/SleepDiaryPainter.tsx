@@ -370,7 +370,8 @@ export default function SleepDiaryPainter() {
         total++;
       }
     }
-    return { percent: total > 0 ? (matches / total) * 100 : NaN, matches, total, usedPairs };
+    
+    return { percent: total > 0 ? (matches / total) * 200 - 100 : NaN, matches, total, usedPairs };
   };
 
   // 起床日ベース情報
