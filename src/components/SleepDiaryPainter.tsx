@@ -880,5 +880,3 @@ export default function SleepDiaryPainter() {
     </div>
   );
 }
-
-
