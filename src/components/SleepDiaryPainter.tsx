@@ -482,33 +482,7 @@ export default function SleepDiaryPainter() {
       lines.push(row.join(","));
     }
 
-    const sriSumm = computeSriForRange();
-    const sriLine = [
-      "SRI_percent",
-      isFinite(sriSumm.percent) ? sriSumm.percent.toFixed(2) : "",
-      "used_pairs",
-      String(sriSumm.usedPairs),
-    ].join(",");
-    lines.push("");
-    lines.push(sriLine);
-
-    const sjlSumm = computeSJL();
-    if (sjlSumm) {
-      const sjlLine = [
-        "SJL_hours",
-        sjlSumm.sjlHours.toFixed(2),
-        "MSF",
-        sjlSumm.msf.toFixed(2),
-        "MSW",
-        sjlSumm.msw.toFixed(2),
-        "n_free",
-        String(sjlSumm.nF),
-        "n_work",
-        String(sjlSumm.nW),
-      ].join(",");
-      lines.push(sjlLine);
-    }
-
+ 
     const csv = lines.join("\n");
     download(`sleep_diary_${pid || "anon"}_${rangeStart}.csv`, csv);
   };
@@ -667,12 +641,6 @@ export default function SleepDiaryPainter() {
           >
             消す
           </button>
-          <button onClick={handleComputeSRI} className="px-3 py-2 rounded-lg border">
-            SRI計算
-          </button>
-          <button onClick={handleComputeSJL} className="px-3 py-2 rounded-lg border">
-            SJL計算
-          </button>
           <button onClick={exportCsv30} className="px-3 py-2 rounded-lg border">
             CSV出力
           </button>
@@ -697,20 +665,7 @@ export default function SleepDiaryPainter() {
         </div>
       </div>
 
-      {/* SRI/SJL（印刷にも残す） */}
-      {sri !== null && (
-        <div className="mt-2 text-sm text-neutral-700 dark:text-neutral-300 print-small">
-          この30日範囲の <strong>SRI = {sri.toFixed(1)}%</strong>
-          {usedPairs > 0 ? <span className="ml-2">(有効ペア: {usedPairs})</span> : null}
-        </div>
-      )}
-      {sjl && (
-        <div className="mt-1 text-sm text-neutral-700 dark:text-neutral-300 print-small">
-          SJL = <strong>{sjl.sjlHours.toFixed(2)} h</strong>
-          <span className="ml-2">(MSF: {sjl.msf.toFixed(2)} h, MSW: {sjl.msw.toFixed(2)} h)</span>
-          <span className="ml-2">[free n={sjl.nF}, work n={sjl.nW}]</span>
-        </div>
-      )}
+
 
       {/* 本体 */}
       <div className="mt-4 space-y-3 select-none print-container">
@@ -925,3 +880,5 @@ export default function SleepDiaryPainter() {
     </div>
   );
 }
+
+
