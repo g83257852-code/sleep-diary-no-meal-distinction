@@ -1,6 +1,39 @@
 "use client";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
+/**
+ * SleepDiaryPainter（30日ビュー / 15分エポック = 96セル）
+ * - ドラッグ/タップで塗る（1=睡眠, 0=覚醒）
+ * - 参加者IDごとに端末内保存（同端末・同ブラウザで続きから）
+ * - 休日/目覚ましチェック
+ *
+ * ★食事入力（区別なし・最大6回）
+ * - 上部で「食事の選択（なし/食事）」を選ぶ
+ * - 各日の「食事」行（96セル）をタップ/ドラッグで塗って時刻を記録
+ *   - なし：消しゴム
+ *   - 食事：その日に複数可（最大6回）
+ *
+ * - CSV（30日一括）出力形式（食事は6列・左詰め）：
+ *   date,weekday,holiday,alarm,meals1,meals2,meals3,meals4,meals5,meals6,bedtime,wakeup,sleep_dur_h,00:00,...,23:45
+ *   ※ meals1..6 は食事セルから自動生成
+ *
+ * - CSVインポート
+ *   - 新形式（meals1..6）に対応
+ *   - 旧形式（meals列の ; 区切り）から復元
+ *   - さらに旧形式（breakfast/lunch/dinner/snacks）からも復元（後方互換）
+ *
+ * - SRI計算：隣接日ペアの時刻一致率（未入力日は除外）
+ * - SJL計算：起床“日”の休日/平日属性でMSF/MSWを算出し差の絶対値
+ *
+ * Hydration-safe（SSR安全）
+ * - rangeStartはマウント後に設定
+ * - localStorageアクセスはuseEffect内
+ *
+ * 追加：
+ * - PDF出力（window.print）＋印刷用CSS（A4横 / UI非表示 / 行の分割防止 / 背景色）
+ * - 画面では入力UIのみ、印刷時は値テキストのみ（.no-print / .print-only）
+ */
+
 const MIN_PER_CELL = 15;
 const CELLS_PER_DAY = (24 * 60) / MIN_PER_CELL; // 96
 const LS_KEY = "sleep-diary-painter-v1";
@@ -14,6 +47,7 @@ const pad2 = (n: number) => n.toString().padStart(2, "0");
 const fmtDateKey = (d: Date) =>
   `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 
+// ローカル日付として安全にパース
 const parseLocalISO = (s: string) => {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(y, (m ?? 1) - 1, d ?? 1);
@@ -92,6 +126,7 @@ const timeToIdx = (t: string) => {
   return idx;
 };
 
+// 連続1区間列挙
 const listRuns = (arr: number[]) => {
   const runs: { s: number; e: number }[] = [];
   let i = 0;
@@ -108,7 +143,7 @@ const listRuns = (arr: number[]) => {
   return runs;
 };
 
-// 主睡眠の推定
+// 起床“日”に紐づけた主睡眠の推定
 const estimateSleepForWakeDay = (
   prevArr: number[] | null,
   dayArr: number[]
@@ -152,7 +187,7 @@ const makeEmptyMealDay = (): MealType[] =>
   Array.from({ length: CELLS_PER_DAY }, () => 0 as MealType);
 
 // meal用のlocalStorageキー（sleepとは別）
-const mealKey = (pid: string) => `${getStoreKey(pid)}:meal_v2`;
+const mealKey = (pid: string) => `${getStoreKey(pid)}:meal_v3`;
 const loadMeals = (pid = "anon"): Record<string, MealType[]> => {
   if (typeof window === "undefined") return {};
   try {
@@ -169,17 +204,18 @@ const saveMeals = (obj: Record<string, MealType[]>, pid = "anon") => {
   } catch {}
 };
 
-// mealセル -> CSV用の時刻文字列（meals）最大6回
+// mealセル -> CSV用の時刻配列（最大6、左詰め）
 const mealTimesFromCells = (cells: MealType[]) => {
   const times = cells
     .map((v, i) => (v === 1 ? idxToTime(i) : null))
     .filter(Boolean) as string[];
 
-  // 最大6回（早い時刻を残す）
   const trimmed = times.slice(0, 6);
+  const slots = Array.from({ length: 6 }, (_, i) => trimmed[i] ?? "");
 
   return {
-    meals: trimmed.join(";"),
+    list: trimmed, // ["07:15","12:30",...]
+    slots, // ["07:15","12:30","","","",""]
     count: trimmed.length,
   };
 };
@@ -199,10 +235,13 @@ function parseCsv(text: string) {
   const idxHoliday = colIndex("holiday");
   const idxAlarm = colIndex("alarm");
 
-  // 新形式
-  const idxMeals = colIndex("meals");
+  // 新形式（6列）
+  const idxMealsN = Array.from({ length: 6 }, (_, i) => colIndex(`meals${i + 1}`));
 
-  // 旧形式（後方互換）
+  // 旧形式（1列 ; 区切り）
+  const idxMealsOld = colIndex("meals");
+
+  // さらに旧形式（後方互換）
   const idxBreakfast = colIndex("breakfast");
   const idxLunch = colIndex("lunch");
   const idxDinner = colIndex("dinner");
@@ -221,7 +260,7 @@ function parseCsv(text: string) {
 
   for (let li = 1; li < lines.length; li++) {
     const row = lines[li].split(",");
-    if (row.length < header.length) continue; // 空行など
+    if (row.length < header.length) continue;
     const key = row[dateIdx]?.trim();
     if (!key || !/\d{4}-\d{2}-\d{2}/.test(key)) continue;
 
@@ -233,38 +272,54 @@ function parseCsv(text: string) {
     });
     store[key] = arr;
 
-    // meta（休日/目覚まし）
+    // meta
     meta[key] = {
       holiday: idxHoliday >= 0 ? row[idxHoliday] === "1" : false,
       alarm: idxAlarm >= 0 ? row[idxAlarm] === "1" : false,
     };
 
-    // 食事：CSVから mealセルを復元（新形式優先、なければ旧形式）
+    // 食事セル復元（新6列 → 旧1列 → breakfast等 の順で試す）
     const cells = makeEmptyMealDay();
 
-    const mealsStr = idxMeals >= 0 ? (row[idxMeals] || "").trim() : "";
-    if (mealsStr) {
-      const meals = mealsStr.split(";").map((s) => s.trim()).filter(Boolean);
-      for (const t of meals.slice(0, 6)) {
+    const hasMealsN = idxMealsN.every((i) => i >= 0);
+    const timesFromMealsN: string[] = [];
+    if (hasMealsN) {
+      for (let i = 0; i < 6; i++) {
+        const t = (row[idxMealsN[i]] || "").trim();
+        if (t) timesFromMealsN.push(t);
+      }
+    }
+
+    if (timesFromMealsN.length > 0) {
+      for (const t of timesFromMealsN.slice(0, 6)) {
         const mi = timeToIdx(t);
         if (mi != null) cells[mi] = 1;
       }
     } else {
-      // 旧形式
-      const bStr = idxBreakfast >= 0 ? (row[idxBreakfast] || "").trim() : "";
-      const lStr = idxLunch >= 0 ? (row[idxLunch] || "").trim() : "";
-      const dStr = idxDinner >= 0 ? (row[idxDinner] || "").trim() : "";
-      const sStr = idxSnacks >= 0 ? (row[idxSnacks] || "").trim() : "";
+      const mealsOld = idxMealsOld >= 0 ? (row[idxMealsOld] || "").trim() : "";
+      if (mealsOld) {
+        const times = mealsOld.split(";").map((s) => s.trim()).filter(Boolean);
+        for (const t of times.slice(0, 6)) {
+          const mi = timeToIdx(t);
+          if (mi != null) cells[mi] = 1;
+        }
+      } else {
+        // さらに旧形式
+        const bStr = idxBreakfast >= 0 ? (row[idxBreakfast] || "").trim() : "";
+        const lStr = idxLunch >= 0 ? (row[idxLunch] || "").trim() : "";
+        const dStr = idxDinner >= 0 ? (row[idxDinner] || "").trim() : "";
+        const sStr = idxSnacks >= 0 ? (row[idxSnacks] || "").trim() : "";
 
-      const times: string[] = [];
-      if (bStr) times.push(bStr);
-      if (lStr) times.push(lStr);
-      if (dStr) times.push(dStr);
-      if (sStr) times.push(...sStr.split(";").map((s) => s.trim()).filter(Boolean));
+        const times: string[] = [];
+        if (bStr) times.push(bStr);
+        if (lStr) times.push(lStr);
+        if (dStr) times.push(dStr);
+        if (sStr) times.push(...sStr.split(";").map((s) => s.trim()).filter(Boolean));
 
-      for (const t of times.slice(0, 6)) {
-        const mi = timeToIdx(t);
-        if (mi != null) cells[mi] = 1;
+        for (const t of times.slice(0, 6)) {
+          const mi = timeToIdx(t);
+          if (mi != null) cells[mi] = 1;
+        }
       }
     }
 
@@ -539,11 +594,9 @@ export default function SleepDiaryPainter() {
       }
     }
 
-    // 元コード踏襲（%表現）
     return { percent: total > 0 ? (matches / total) * 200 - 100 : NaN, matches, total, usedPairs };
   };
 
-  // 起床日ベース情報
   const estimateForWakeDay = (
     key: string
   ): { bed: string; wake: string; midHour: number | null; durHours: number | null } => {
@@ -606,7 +659,7 @@ export default function SleepDiaryPainter() {
     setSjl(r);
   };
 
-  // ===== CSV エクスポート（新形式）=====
+  // ===== CSV エクスポート（食事6列）=====
   const exportCsv30 = () => {
     if (!rangeStart) return;
 
@@ -615,7 +668,12 @@ export default function SleepDiaryPainter() {
       "weekday",
       "holiday",
       "alarm",
-      "meals",
+      "meals1",
+      "meals2",
+      "meals3",
+      "meals4",
+      "meals5",
+      "meals6",
       "bedtime",
       "wakeup",
       "sleep_dur_h",
@@ -634,15 +692,14 @@ export default function SleepDiaryPainter() {
       const info = estimateForWakeDay(key);
       const durStr = info.durHours != null ? info.durHours.toFixed(2) : "";
 
-      // 食事セルから自動生成
-      const mt = mealTimesFromCells(getMealDay(key));
+      const mt = mealTimesFromCells(getMealDay(key)); // slots: 6
 
       const row = [
         key,
         weekday,
         m.holiday ? 1 : 0,
         m.alarm ? 1 : 0,
-        mt.meals,
+        ...mt.slots, // ★左から詰めた6列
         info.bed,
         info.wake,
         durStr,
@@ -665,7 +722,6 @@ export default function SleepDiaryPainter() {
       const { store: s, meta: m, mealStore: ms, minDate } = parseCsv(text);
       const id = pid || "anon";
 
-      // 状態更新 & 永続化
       setStore(s);
       saveAll(s, id);
 
@@ -677,7 +733,6 @@ export default function SleepDiaryPainter() {
       setMealStore(ms);
       saveMeals(ms, id);
 
-      // 表示開始日をインポートの最小日に
       if (minDate) setRangeStart(minDate);
 
       alert("CSVを読み込みました。画面に反映しています。");
@@ -685,7 +740,7 @@ export default function SleepDiaryPainter() {
       console.error(err);
       alert(`CSV読み込みに失敗しました: ${err?.message || err}`);
     } finally {
-      if (fileInputRef.current) fileInputRef.current.value = ""; // 同じファイル再読込可
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
@@ -769,15 +824,11 @@ export default function SleepDiaryPainter() {
             食事は上部で「食事/なし」を選び、各日の「食事」行を塗って時刻を記録します（区別なし・最大6回）。
           </li>
           <li>
-            「CSV出力」では、日付、起床時刻、就寝時刻、睡眠時間、食事時刻（meals）、
+            「CSV出力」では、日付、起床時刻、就寝時刻、睡眠時間、食事時刻（meals1〜6）、
             睡眠日誌の15分ごとのバイナリデータが出力されます。
           </li>
-          <li>「CSV読み込み」で過去のCSVを復元し、続きから記入できます（同形式推奨）。</li>
+          <li>「CSV読み込み」で過去のCSVを復元し、続きから記入できます。</li>
           <li>「PDF出力」では、睡眠日誌がそのまま出力されます。</li>
-          <li>
-            同じ端末・同じブラウザでアクセスすると続きから記入できます（シークレットモード、履歴やキャッシュの削除には対応していません）
-          </li>
-          <li>スマートフォンで記入する場合は、画面の設定をライトモードにして、横画面にすると記入しやすいです。</li>
         </ul>
 
         <div className="flex flex-wrap items-center gap-3 mt-2 text-sm">
@@ -916,7 +967,6 @@ export default function SleepDiaryPainter() {
                     {key}（{WEEKDAYS_JP[parseLocalISO(key).getDay()]}）
                   </div>
 
-                  {/* 休日/目覚まし：印刷では✓だけ残す */}
                   <label className="inline-flex items-center gap-1">
                     <input
                       type="checkbox"
@@ -949,11 +999,10 @@ export default function SleepDiaryPainter() {
                     睡眠時間: <strong>{info.durHours != null ? `${info.durHours.toFixed(2)} h` : "--"}</strong>
                   </span>
 
-                  {/* 食事（最大6） */}
                   <span className="text-neutral-500 print-small">
                     食事:{" "}
                     <strong>
-                      {mealInfo.meals ? mealInfo.meals.replaceAll(";", "/") : "--"}
+                      {mealInfo.list.length ? mealInfo.list.join(" / ") : "--"}
                     </strong>
                   </span>
                 </div>
@@ -983,7 +1032,6 @@ export default function SleepDiaryPainter() {
               <div className="mt-2 flex items-center gap-2">
                 <div className="w-40 shrink-0" />
                 <div className="relative grow">
-                  {/* ベースライン */}
                   <div
                     className="grid text-[10px] text-neutral-500 select-none"
                     style={{ gridTemplateColumns: `repeat(${CELLS_PER_DAY}, minmax(0,1fr))` }}
@@ -996,7 +1044,6 @@ export default function SleepDiaryPainter() {
                     ))}
                   </div>
 
-                  {/* ラベル（1h / 2h） */}
                   <div
                     className="absolute inset-0 grid text-[10px] sm:text-[11px] print-label"
                     style={{ gridTemplateColumns: `repeat(${CELLS_PER_DAY}, minmax(0,1fr))` }}
@@ -1025,9 +1072,24 @@ export default function SleepDiaryPainter() {
                         v === 1 ? "bg-indigo-500/80" : "bg-white dark:bg-neutral-900"
                       }`}
                       style={{ touchAction: "none", userSelect: "none" }}
-                      onPointerDown={handlePointerDownAt(key, idx)}
-                      onPointerMove={handlePointerMoveAt(key, idx)}
-                      onPointerEnter={handlePointerEnterAt(key, idx)}
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        if (e.pointerType === "mouse" && (e as any).button !== 0) return;
+                        setIsPainting(true);
+                        const val: 0 | 1 = eraser ? 0 : 1;
+                        setPaintValue(val);
+                        paintingKeyRef.current = key;
+                        lastIdxRef.current = idx;
+                        paintSpan(key, idx, idx, val);
+                      }}
+                      onPointerMove={(e) => {
+                        if (!isPainting || paintingKeyRef.current !== key) return;
+                        paintSpan(key, lastIdxRef.current, idx, paintValue);
+                      }}
+                      onPointerEnter={(e) => {
+                        if (!isPainting || paintingKeyRef.current !== key) return;
+                        paintSpan(key, lastIdxRef.current, idx, paintValue);
+                      }}
                       onPointerUp={handlePointerUpAt}
                     />
                   ))}
@@ -1045,9 +1107,22 @@ export default function SleepDiaryPainter() {
                         mv === 0 ? "bg-white dark:bg-neutral-900" : "bg-green-500"
                       }`}
                       style={{ touchAction: "none", userSelect: "none" }}
-                      onPointerDown={handleMealPointerDownAt(key, idx)}
-                      onPointerMove={handleMealPointerMoveAt(key, idx)}
-                      onPointerEnter={handleMealPointerEnterAt(key, idx)}
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        if (e.pointerType === "mouse" && (e as any).button !== 0) return;
+                        setIsMealPainting(true);
+                        mealPaintingKeyRef.current = key;
+                        mealLastIdxRef.current = idx;
+                        paintMealSpan(key, idx, idx, mealMode);
+                      }}
+                      onPointerMove={(e) => {
+                        if (!isMealPainting || mealPaintingKeyRef.current !== key) return;
+                        paintMealSpan(key, mealLastIdxRef.current, idx, mealMode);
+                      }}
+                      onPointerEnter={(e) => {
+                        if (!isMealPainting || mealPaintingKeyRef.current !== key) return;
+                        paintMealSpan(key, mealLastIdxRef.current, idx, mealMode);
+                      }}
                       onPointerUp={handleMealPointerUpAt}
                       title={mv === 1 ? `食事 ${idxToTime(idx)}` : ""}
                     />
